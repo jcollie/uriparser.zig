@@ -1,0 +1,15 @@
+.{
+    .name = "uriparser.zig",
+    .version = "0.9.7",
+
+    .dependencies = .{
+        .uriparser = .{
+            .url = "https://github.com/uriparser/uriparser/releases/download/uriparser-0.9.7/uriparser-0.9.7.tar.gz",
+            .hash = "12201e8848cfa2121fdc573595f630a99c27e20b4c9ba9b435315b41197ab4bc993d",
+        },
+    },
+
+    .paths = .{
+        "",
+    },
+}
