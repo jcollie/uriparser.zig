@@ -249,18 +249,17 @@ const Uri = struct {
         errdefer list.deinit();
 
         var ptr = query_list;
-        while (ptr) |node| {
+        while (ptr) |node| : (ptr = node.next) {
             list.append(
                 .{
                     .key = try alloc.dupe(std.mem.span(node.key)),
                     .value = if (node.value != null) try alloc.dupe(std.mem.span(node.value)) else null,
                 },
             );
-            ptr = node.next;
         }
     }
 
-    pub fn toString(self: *Uri, alloc: std.mem.Allocator) ![:0]const u8 {
+    pub fn recompose(self: *Uri, alloc: std.mem.Allocator) ![:0]const u8 {
         var required: c_int = undefined;
 
         try wrap(c.uriToStringCharsRequiredA(&self.uri, &required));
@@ -297,7 +296,7 @@ test "basic parse" {
     const expected = "https://www.example.com";
     var uri = try Uri.parse(std.testing.allocator, expected, .{});
     defer uri.deinit();
-    const actual = try uri.toString(std.testing.allocator);
+    const actual = try uri.recompose(std.testing.allocator);
     defer std.testing.allocator.free(actual);
     try std.testing.expectEqualSentinel(u8, 0, expected, actual);
 }
@@ -315,7 +314,7 @@ test "resolve" {
     const resolved = try base.resolve(relative);
     defer resolved.deinit();
 
-    const actual = try resolved.toString(std.testing.allocator);
+    const actual = try resolved.recompose(std.testing.allocator);
     defer std.testing.allocator.free(actual);
 
     try std.testing.expectEqualSentinel(u8, 0, "file:///one/TWO", actual);
