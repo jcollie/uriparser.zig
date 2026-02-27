@@ -1,23 +1,23 @@
+// SPDX-FileCopyrightText: © 2024 Jeffrey C. Ollie
+// SPDX-License-Identifier: MIT
+
 const std = @import("std");
 const builtin = @import("builtin");
-pub const c = @import("c.zig");
+pub const c = @import("Uri.h");
 
 const log = std.log.scoped(.uriparser);
 
 // Use Zig ArenaAllocator to allocate memory for uriparser.
-fn _malloc(mmc: [*c]c.UriMemoryManager, size: usize) callconv(.C) ?*anyopaque {
+fn _malloc(mmc: [*c]c.UriMemoryManager, size: usize) callconv(.c) ?*anyopaque {
     const mm: *c.UriMemoryManager = @ptrCast(@alignCast(mmc));
     const arena: *std.heap.ArenaAllocator = @ptrCast(@alignCast(mm.userData));
     const alloc = arena.allocator();
-    const mem = alloc.alloc(u8, size) catch |err| {
-        log.err("unable to alloc {}", .{err});
-        return null;
-    };
+    const mem = alloc.alloc(u8, size) catch return null;
     return mem.ptr;
 }
 
 // This is a NOOP since we are using an ArenaAllocator
-fn _free(_: [*c]c.UriMemoryManager, _: ?*anyopaque) callconv(.C) void {}
+fn _free(_: [*c]c.UriMemoryManager, _: ?*anyopaque) callconv(.c) void {}
 
 fn textRangeToString(range: *c.UriTextRangeA) ?[]const u8 {
     if (range.first == null or range.afterLast == null) return null;
@@ -44,7 +44,7 @@ const Error = error{
 
 fn wrap(errno: c_int) Error!void {
     return switch (errno) {
-        c.URI_SUCCESS => void{},
+        c.URI_SUCCESS => {},
         c.URI_ERROR_SYNTAX => error.SyntaxError,
         c.URI_ERROR_NULL => error.NullParameter,
         c.URI_ERROR_MALLOC => error.OutOfMemory,
@@ -106,43 +106,47 @@ const QueryKV = struct {
 
 const Uri = struct {
     arena: std.heap.ArenaAllocator,
-    mm: c.UriMemoryManager,
-    backend: c.UriMemoryManager,
+    memory_manager: c.UriMemoryManager,
+    memory_manager_backend: c.UriMemoryManager,
     uri: c.UriUriA,
 
     fn new(allocator: std.mem.Allocator) !*Uri {
-        var arena = std.heap.ArenaAllocator.init(allocator);
+        var arena: std.heap.ArenaAllocator = .init(allocator);
         errdefer arena.deinit();
 
         const alloc = arena.allocator();
 
         var uri = try alloc.create(Uri);
 
-        uri.*.arena = arena;
-        uri.*.backend = .{
-            .malloc = _malloc,
-            .calloc = null,
-            .realloc = null,
-            .reallocarray = null,
-            .free = _free,
-            .userData = &uri.arena,
+        uri.* = .{
+            .arena = arena,
+            .memory_manager = undefined,
+            .memory_manager_backend = .{
+                .malloc = _malloc,
+                .calloc = null,
+                .realloc = null,
+                .reallocarray = null,
+                .free = _free,
+                .userData = &uri.arena,
+            },
+            .uri = std.mem.zeroes(c.UriUriA),
         };
 
-        try wrap(c.uriCompleteMemoryManager(&uri.mm, &uri.backend));
+        try wrap(c.uriCompleteMemoryManager(&uri.memory_manager, &uri.memory_manager_backend));
 
-        @memset(@as([*]u8, @ptrCast(&uri.uri))[0..@sizeOf(c.UriUriA)], 0);
+        // @memset(@as([*]u8, @ptrCast(&uri.uri))[0..@sizeOf(c.UriUriA)], 0);
 
         return uri;
     }
 
-    pub fn parse(allocator: std.mem.Allocator, text: [:0]const u8, options: struct {
+    pub fn parse(alloc: std.mem.Allocator, text: [:0]const u8, options: struct {
         log_errors: bool = false,
     }) !*Uri {
-        var uri = try Uri.new(allocator);
+        var uri = try Uri.new(alloc);
         errdefer uri.deinit();
 
         var err_ptr: [*c]const u8 = undefined;
-        wrap(c.uriParseSingleUriExMmA(&uri.uri, text, &text[text.len], &err_ptr, &uri.mm)) catch |err| {
+        wrap(c.uriParseSingleUriExMmA(&uri.uri, text, &text[text.len], &err_ptr, &uri.memory_manager)) catch |err| {
             if (options.log_errors)
                 switch (err) {
                     error.SyntaxError => {
@@ -152,8 +156,8 @@ const Uri = struct {
                             const err_pos = @intFromPtr(err_ptr) - @intFromPtr(text.ptr);
                             if (err_pos > text.len) break :err_pos null;
 
-                            var location = try allocator.alloc(u8, text.len);
-                            defer allocator.free(location);
+                            var location = try alloc.alloc(u8, text.len);
+                            defer alloc.free(location);
                             @memset(location, '~');
                             location[err_pos] = '^';
 
@@ -175,7 +179,7 @@ const Uri = struct {
     }
 
     pub fn deinit(self: *Uri) void {
-        wrap(c.uriFreeUriMembersMmA(&self.uri, &self.mm)) catch {};
+        wrap(c.uriFreeUriMembersMmA(&self.uri, &self.memory_manager)) catch {};
         self.arena.deinit();
     }
 
@@ -207,57 +211,98 @@ const Uri = struct {
         return textRangeToString(&self.uri.hostText);
     }
 
-    pub fn port(self: *Uri) !?u16 {
+    pub fn port(self: *Uri) std.fmt.ParseIntError!?u16 {
         if (textRangeToString(&self.uri.portText)) |text|
             return try std.fmt.parseUnsigned(u16, text, 10);
         return null;
     }
 
-    pub fn path(self: *Uri) ![]const []const u8 {
-        var list = std.ArrayList([]const u8).init(self.arena.allocator());
-        errdefer list.deinit();
-
-        var ptr: ?*c.UriPathSegmentA = self.uri.pathHead;
-        while (ptr) |node| {
-            if (textRangeToString(&node.text)) |text|
-                try list.append(text)
-            else
-                try list.append("");
-            ptr = node.next;
-        }
-
-        return try list.toOwnedSlice();
+    pub fn pathIterator(self: *Uri) PathIterator {
+        return .{
+            .uri = self,
+            .ptr = self.uri.pathHead,
+        };
     }
 
-    pub fn query(self: *Uri) ![]QueryKV {
-        const alloc = self.arena.allocator();
+    pub const PathIterator = struct {
+        uri: *Uri,
+        ptr: ?*c.UriPathSegmentA,
 
-        var query_list: ?c.UriQueryListA = undefined;
-        var count: c_int = undefined;
-        try wrap(c.uriDissectQueryMallocExMmA(
-            &query_list,
-            &count,
-            self.uri.query.first,
-            self.uri.query.afterLast,
-            true,
-            c.URI_BR_DONT_TOUCH,
-            &self.mm,
-        ));
-        defer c.uriFreeQueryListA(query_list);
-
-        var list = std.ArrayList(QueryKV).init(self.arena);
-        errdefer list.deinit();
-
-        var ptr = query_list;
-        while (ptr) |node| : (ptr = node.next) {
-            list.append(
-                .{
-                    .key = try alloc.dupe(std.mem.span(node.key)),
-                    .value = if (node.value != null) try alloc.dupe(std.mem.span(node.value)) else null,
-                },
-            );
+        pub fn next(self: *PathIterator) ?[]const u8 {
+            const node = self.ptr orelse return null;
+            const text = textRangeToString(&node.text) orelse "";
+            self.ptr = node.next;
+            return text;
         }
-    }
+    };
+
+    // pub fn query(self: *Uri) ![]QueryKV {
+    //     const alloc = self.arena.allocator();
+
+    //     var query_list: ?c.UriQueryListA = undefined;
+    //     var count: c_int = undefined;
+    //     try wrap(c.uriDissectQueryMallocExMmA(
+    //         &query_list,
+    //         &count,
+    //         self.uri.query.first,
+    //         self.uri.query.afterLast,
+    //         true,
+    //         c.URI_BR_DONT_TOUCH,
+    //         &self.memory_manager,
+    //     ));
+    //     defer c.uriFreeQueryListA(query_list);
+
+    //     var list = std.ArrayList(QueryKV).init(self.arena);
+    //     errdefer list.deinit();
+
+    //     var ptr = query_list;
+    //     while (ptr) |node| : (ptr = node.next) {
+    //         list.append(
+    //             .{
+    //                 .key = try alloc.dupe(std.mem.span(node.key)),
+    //                 .value = if (node.value != null) try alloc.dupe(std.mem.span(node.value)) else null,
+    //             },
+    //         );
+    //     }
+    // }
+
+    pub const QueryIterator = struct {
+        ptr: ?c.UriQueryListA,
+        count: c_int,
+
+        pub fn init(uri: *Uri) Error!QueryIterator {
+            var ptr: ?c.UriQueryListA = undefined;
+            var count: usize = undefined;
+
+            try wrap(c.uriDissectQueryMallocExMmA(
+                &ptr,
+                &count,
+                uri.uri.query.first,
+                uri.uri.query.afterLast,
+                true,
+                c.URI_BR_DONT_TOUCH,
+                &uri.memory_manager,
+            ));
+
+            return .{
+                .ptr = ptr,
+                .count = count,
+            };
+        }
+
+        pub fn next(self: *QueryIterator) ?QueryKV {
+            const node = self.ptr orelse return null;
+            self.ptr = node.next;
+            return .{
+                .key = std.mem.spam(node.key),
+                .value = if (node.value) |value| std.mem.span(value) orelse null,
+            };
+        }
+
+        pub fn deinit(self: *QueryIterator) void {
+            c.uriFreeQueryListA(self.ptr);
+        }
+    };
 
     pub fn recompose(self: *Uri, alloc: std.mem.Allocator) ![:0]const u8 {
         var required: c_int = undefined;
@@ -278,11 +323,11 @@ const Uri = struct {
         return try alloc.dupeZ(u8, str[0..@intCast(written - 1)]);
     }
 
-    pub fn resolve(self: *Uri, ref: *Uri) !*Uri {
-        var dest = try Uri.new(self.arena.child_allocator);
+    pub fn resolve(self: *Uri, alloc: std.mem.Allocator, ref: *Uri) Error!*Uri {
+        var dest = try Uri.new(alloc);
         errdefer dest.deinit();
 
-        try wrap(c.uriAddBaseUriExMmA(&dest.uri, &ref.uri, &self.uri, 0, &self.mm));
+        try wrap(c.uriAddBaseUriExMmA(&dest.uri, &ref.uri, &self.uri, 0, &dest.memory_manager));
 
         return dest;
     }
@@ -293,11 +338,12 @@ const Uri = struct {
 };
 
 test "basic parse" {
+    const alloc = std.testing.allocator;
     const expected = "https://www.example.com";
-    var uri = try Uri.parse(std.testing.allocator, expected, .{});
+    var uri = try Uri.parse(alloc, expected, .{});
     defer uri.deinit();
-    const actual = try uri.recompose(std.testing.allocator);
-    defer std.testing.allocator.free(actual);
+    const actual = try uri.recompose(alloc);
+    defer alloc.free(actual);
     try std.testing.expectEqualSentinel(u8, 0, expected, actual);
 }
 
@@ -306,16 +352,17 @@ test "parse error" {
 }
 
 test "resolve" {
-    const base = try Uri.parse(std.testing.allocator, "file:///one/two/three", .{});
+    const alloc = std.testing.allocator;
+    const base = try Uri.parse(alloc, "file:///one/two/three", .{});
     defer base.deinit();
-    const relative = try Uri.parse(std.testing.allocator, "../TWO", .{});
+    const relative = try Uri.parse(alloc, "../TWO", .{});
     defer relative.deinit();
 
-    const resolved = try base.resolve(relative);
+    const resolved = try base.resolve(alloc, relative);
     defer resolved.deinit();
 
-    const actual = try resolved.recompose(std.testing.allocator);
-    defer std.testing.allocator.free(actual);
+    const actual = try resolved.recompose(alloc);
+    defer alloc.free(actual);
 
     try std.testing.expectEqualSentinel(u8, 0, "file:///one/TWO", actual);
 }
@@ -323,10 +370,11 @@ test "resolve" {
 test "path" {
     const uri = try Uri.parse(std.testing.allocator, "file:///one/two/three", .{});
     defer uri.deinit();
-    const path = try uri.path();
-    try std.testing.expectEqualStrings("one", path[0]);
-    try std.testing.expectEqualStrings("two", path[1]);
-    try std.testing.expectEqualStrings("three", path[2]);
+    const it = uri.pathIterator();
+    try std.testing.expectEqualStrings("one", it.next().?);
+    try std.testing.expectEqualStrings("two", it.next().?);
+    try std.testing.expectEqualStrings("three", it.next().?);
+    try std.testing.expect(it.next() == null);
 }
 
 pub fn toFileUri(alloc: std.mem.Allocator, path: [:0]const u8) ![:0]const u8 {

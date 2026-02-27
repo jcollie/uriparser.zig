@@ -1,15 +1,23 @@
+// SPDX-FileCopyrightText: © 2024 Jeffrey C. Ollie
+// SPDX-License-Identifier: MIT
+
 .{
-    .name = "uriparser.zig",
+    .name = .uriparser_zig,
     .version = "0.9.7",
+    .fingerprint = 0xb32989c682c06eaa,
+    .minimum_zig_version = "0.16.0-dev.2670+56253d9e3",
 
     .dependencies = .{
         .uriparser = .{
             .url = "https://github.com/uriparser/uriparser/releases/download/uriparser-0.9.7/uriparser-0.9.7.tar.gz",
-            .hash = "12201e8848cfa2121fdc573595f630a99c27e20b4c9ba9b435315b41197ab4bc993d",
+            .hash = "N-V-__8AACbfDwAeiEjPohIf3Fc1lfYwqZwn4gtMm6m0NTFb",
         },
     },
 
     .paths = .{
-        "",
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSES",
     },
 }
